@@ -1,0 +1,12 @@
+{
+  "name": "offgrid-gridbot",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.19.0",
+    "dotenv": "^16.0.0"
+  }
+}
