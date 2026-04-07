@@ -1,4 +1,3 @@
-require('dotenv').config();
 const { App } = require('@slack/bolt');
 const https = require('https');
 
@@ -12,15 +11,14 @@ const slack = new App({
 
 const RELEASES_CHANNEL_ID = process.env.CH_RELEASES;
 const GITHUB_REPO = 'alichherawalla/off-grid-mobile-ai';
-const CHECK_INTERVAL_MS = 15 * 60 * 1000; // check every 15 minutes
+const CHECK_INTERVAL_MS = 15 * 60 * 1000;
 
-const IOS_UPDATE_URL   = 'https://apps.apple.com/in/app/off-grid-private-ai-chat/id6759299882';
-const IOS_REVIEW_URL   = 'https://apps.apple.com/in/app/off-grid-private-ai-chat/id6759299882?action=write-review';
+const IOS_UPDATE_URL     = 'https://apps.apple.com/in/app/off-grid-private-ai-chat/id6759299882';
+const IOS_REVIEW_URL     = 'https://apps.apple.com/in/app/off-grid-private-ai-chat/id6759299882?action=write-review';
 const ANDROID_UPDATE_URL = 'https://play.google.com/store/apps/details?id=ai.offgridmobile&hl=en_IN';
 const ANDROID_REVIEW_URL = 'https://play.google.com/store/apps/details?id=ai.offgridmobile&hl=en_IN&reviewId=0';
 const GITHUB_RELEASE_URL = `https://github.com/${GITHUB_REPO}/releases`;
 
-// ── Track last seen release ───────────────────────────────
 let lastSeenVersion = null;
 
 // ── Fetch latest GitHub release ───────────────────────────
@@ -42,41 +40,48 @@ function fetchLatestRelease() {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(e);
-        }
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
       });
     }).on('error', reject);
   });
 }
 
 // ── Build the Slack release message ──────────────────────
-function buildReleaseMessage(release) {
-  // Clean up GitHub release notes
+function buildReleaseMessage(release, isTest = false) {
   const notes = release.body
     ? release.body
         .split('\n')
         .filter(line => line.trim())
-        .slice(0, 8) // cap at 8 lines
+        .slice(0, 8)
         .map(line => line.startsWith('-') || line.startsWith('*')
           ? `→ ${line.replace(/^[-*]\s*/, '')}`
           : line)
         .join('\n')
     : 'See GitHub for full changelog.';
 
+  const testBanner = isTest ? '\n\n⚠️ _This is a test message — not a real release notification._' : '';
+
   return {
     channel: RELEASES_CHANNEL_ID,
     text: `🚀 Off Grid ${release.tag_name} is now live!`,
     blocks: [
+
+      // ── Test badge (only shown during test) ─────────────
+      ...(isTest ? [{
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `🧪 *TEST MODE* — This is a preview of the release notification format.`,
+        },
+      }, { type: 'divider' }] : []),
 
       // ── Header ─────────────────────────────────────────
       {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `🚀 *Off Grid ${release.tag_name} is now live!*`,
+          text: `🚀 *Off Grid ${release.tag_name} is now live!*${testBanner}`,
         },
       },
 
@@ -96,10 +101,7 @@ function buildReleaseMessage(release) {
       // ── iOS ─────────────────────────────────────────────
       {
         type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `📱 *iOS*`,
-        },
+        text: { type: 'mrkdwn', text: `📱 *iOS*` },
       },
       {
         type: 'actions',
@@ -123,10 +125,7 @@ function buildReleaseMessage(release) {
       // ── Android ─────────────────────────────────────────
       {
         type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `🤖 *Android*`,
-        },
+        text: { type: 'mrkdwn', text: `🤖 *Android*` },
       },
       {
         type: 'actions',
@@ -174,19 +173,16 @@ async function checkForNewRelease() {
       return;
     }
 
-    // First run — just store the version, don't post
     if (lastSeenVersion === null) {
       lastSeenVersion = release.tag_name;
       console.log(`📌 Current version: ${lastSeenVersion} — watching for new releases...`);
       return;
     }
 
-    // New release detected
     if (release.tag_name !== lastSeenVersion) {
       console.log(`🚀 New release detected: ${release.tag_name}`);
       lastSeenVersion = release.tag_name;
-
-      const message = buildReleaseMessage(release);
+      const message = buildReleaseMessage(release, false);
       await slack.client.chat.postMessage(message);
       console.log(`✅ Posted release ${release.tag_name} to #releases`);
     } else {
@@ -198,14 +194,40 @@ async function checkForNewRelease() {
   }
 }
 
+// ── TEST TRIGGER — type "Test release" in any channel ─────
+slack.message(/test release/i, async ({ message, client, logger }) => {
+  try {
+    logger.info(`🧪 Test release triggered by ${message.user}`);
+    const release = await fetchLatestRelease();
+
+    if (!release.tag_name) {
+      await client.chat.postMessage({
+        channel: message.channel,
+        text: '⚠️ No releases found on GitHub yet.',
+      });
+      return;
+    }
+
+    const testMessage = buildReleaseMessage(release, true);
+    testMessage.channel = message.channel; // reply in same channel
+    await client.chat.postMessage(testMessage);
+    logger.info(`✅ Test release message posted to channel ${message.channel}`);
+
+  } catch (err) {
+    logger.error('❌ Test trigger error:', err.message);
+    await client.chat.postMessage({
+      channel: message.channel,
+      text: `❌ Test failed: ${err.message}`,
+    });
+  }
+});
+
 // ── Boot ──────────────────────────────────────────────────
 (async () => {
   await slack.start();
   console.log('⚡ Releases bot running');
+  console.log('💬 Tip: type "Test release" in any channel to preview the release message');
 
-  // Check immediately on start
   await checkForNewRelease();
-
-  // Then check every 15 minutes
   setInterval(checkForNewRelease, CHECK_INTERVAL_MS);
 })();
