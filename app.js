@@ -1,6 +1,8 @@
 require('dotenv').config();
 const https = require('https');
 const { App } = require('@slack/bolt');
+const gplay = require('google-play-scraper').default;
+const nodemailer = require('nodemailer');
 
 // ── ENV validation ───────────────────────────────────────
 const REQUIRED_ENV = ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET'];
@@ -29,17 +31,27 @@ const app = new App({
 // ── Config ───────────────────────────────────────────────
 const INTRO_CHANNEL_ID    = process.env.CH_INTRODUCTIONS;
 const RELEASES_CHANNEL_ID = process.env.CH_RELEASES;
-const GITHUB_REPO         = process.env.GITHUB_REPO || 'alichherawalla/off-grid-mobile-ai';
 const CHECK_INTERVAL_MS   = 15 * 60 * 1000; // 15 minutes
 
-const IOS_UPDATE_URL     = 'https://apps.apple.com/in/app/off-grid-private-ai-chat/id6759299882';
-const IOS_REVIEW_URL     = 'https://apps.apple.com/in/app/off-grid-private-ai-chat/id6759299882?action=write-review';
-const ANDROID_UPDATE_URL = 'https://play.google.com/store/apps/details?id=ai.offgridmobile&hl=en_IN';
-const ANDROID_REVIEW_URL = 'https://play.google.com/store/apps/details?id=ai.offgridmobile&hl=en_IN&reviewId=0';
+const IOS_APP_ID         = '6759299882';
+const ANDROID_APP_ID     = 'ai.offgridmobile';
+const GITHUB_REPO        = process.env.GITHUB_REPO || 'alichherawalla/off-grid-mobile-ai';
+const IOS_UPDATE_URL     = `https://apps.apple.com/in/app/off-grid-private-ai-chat/id${IOS_APP_ID}`;
+const IOS_REVIEW_URL     = `https://apps.apple.com/in/app/off-grid-private-ai-chat/id${IOS_APP_ID}?action=write-review`;
+const ANDROID_UPDATE_URL = `https://play.google.com/store/apps/details?id=${ANDROID_APP_ID}&hl=en_IN`;
+const ANDROID_REVIEW_URL = `https://play.google.com/store/apps/details?id=${ANDROID_APP_ID}&hl=en_IN&reviewId=0`;
 const GITHUB_RELEASE_URL = `https://github.com/${GITHUB_REPO}/releases`;
 
-let lastSeenVersion = null;
-let cachedRelease = null; // cached for trigger-word responses
+const ALERT_EMAILS = [
+  'saiganesh.menon@gmail.com',
+  'saiganesh.menon@wednesday.is',
+];
+
+// Track versions per platform
+let lastSeenIosVersion = null;
+let lastSeenAndroidVersion = null;
+let lastSeenGithubVersion = null;
+let cachedStoreInfo = null; // cached for trigger-word responses
 
 // ═══════════════════════════════════════════════════════════
 // 1. INTRO DM — sent to every new member on team_join
@@ -156,17 +168,94 @@ app.command('/test-intro', async ({ command, ack, client, logger }) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// 2. RELEASES — poll GitHub and post to #releases
+// 2. RELEASES — poll App Store + Play Store (GitHub fallback)
 // ═══════════════════════════════════════════════════════════
 
-function fetchLatestRelease() {
+// ── Email alerts ─────────────────────────────────────────
+const mailer = process.env.SMTP_USER && process.env.SMTP_PASS
+  ? nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    })
+  : null;
+
+async function sendAlertEmail(subject, body) {
+  if (!mailer) {
+    console.log('SMTP not configured — skipping email alert');
+    return;
+  }
+  try {
+    await mailer.sendMail({
+      from: process.env.SMTP_USER,
+      to: ALERT_EMAILS.join(', '),
+      subject: `[GridBot] ${subject}`,
+      text: body,
+    });
+    console.log(`Alert email sent: ${subject}`);
+  } catch (err) {
+    console.error('Failed to send alert email:', err.message);
+  }
+}
+
+// ── Store fetchers ───────────────────────────────────────
+function fetchIosVersion() {
+  return new Promise((resolve, reject) => {
+    https.get(`https://itunes.apple.com/lookup?id=${IOS_APP_ID}`, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.results && json.results[0];
+          if (!result) return resolve(null);
+          resolve({
+            version: result.version,
+            releaseNotes: result.releaseNotes || '',
+            releaseDate: result.currentVersionReleaseDate,
+          });
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+async function fetchAndroidVersion() {
+  const result = await gplay.app({ appId: ANDROID_APP_ID });
+  return {
+    version: result.version,
+    releaseNotes: (result.recentChanges || '').replace(/<br\s*\/?>/gi, '\n'),
+    updated: result.updated,
+  };
+}
+
+async function fetchStoreVersions() {
+  const [ios, android] = await Promise.allSettled([
+    fetchIosVersion(),
+    fetchAndroidVersion(),
+  ]);
+
+  const failures = [];
+  if (ios.status === 'rejected') failures.push(`iOS App Store: ${ios.reason?.message || 'unknown error'}`);
+  if (android.status === 'rejected') failures.push(`Google Play Store: ${android.reason?.message || 'unknown error'}`);
+
+  return {
+    ios: ios.status === 'fulfilled' ? ios.value : null,
+    android: android.status === 'fulfilled' ? android.value : null,
+    failures,
+  };
+}
+
+// ── GitHub fallback ──────────────────────────────────────
+function fetchGithubRelease() {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'api.github.com',
       path: `/repos/${GITHUB_REPO}/releases/latest`,
       headers: {
         'User-Agent': 'GridBot/1.0',
-        'Accept': 'application/vnd.github.v3+json',
+        Accept: 'application/vnd.github.v3+json',
         ...(process.env.GITHUB_TOKEN && {
           Authorization: `token ${process.env.GITHUB_TOKEN}`,
         }),
@@ -187,147 +276,255 @@ function fetchLatestRelease() {
   });
 }
 
-function buildReleaseMessage(release, { isTest = false, channel = RELEASES_CHANNEL_ID } = {}) {
-  const notes = release.body
-    ? release.body
-        .split('\n')
-        .filter((line) => line.trim())
-        .slice(0, 8)
-        .map((line) =>
-          line.startsWith('-') || line.startsWith('*')
-            ? `> ${line.replace(/^[-*]\s*/, '')}`
-            : line,
-        )
-        .join('\n')
-    : 'See GitHub for full changelog.';
+function githubReleaseToStoreInfo(release) {
+  // Convert GitHub release into the same shape as store info
+  // so buildReleaseMessage works with either source
+  const notes = release.body || 'See GitHub for full changelog.';
+  return {
+    ios: { version: release.tag_name, releaseNotes: notes, releaseDate: release.published_at },
+    android: { version: release.tag_name, releaseNotes: notes, updated: release.published_at },
+    source: 'github',
+  };
+}
+
+// ── Message builder ──────────────────────────────────────
+function formatNotes(notes) {
+  if (!notes) return '_No release notes provided._';
+  return notes
+    .split('\n')
+    .filter((line) => line.trim())
+    .slice(0, 8)
+    .map((line) =>
+      line.startsWith('-') || line.startsWith('*')
+        ? `> ${line.replace(/^[-*]\s*/, '')}`
+        : `> ${line}`,
+    )
+    .join('\n');
+}
+
+function buildReleaseMessage(storeInfo, { isTest = false, channel = RELEASES_CHANNEL_ID, platform = 'both' } = {}) {
+  const { ios, android } = storeInfo;
+  const isGithubFallback = storeInfo.source === 'github';
+
+  const version = platform === 'ios'
+    ? ios?.version
+    : platform === 'android'
+      ? android?.version
+      : ios?.version || android?.version;
 
   const testBanner = isTest
     ? '\n\n_This is a test message — not a real release notification._'
     : '';
 
-  return {
-    channel,
-    text: `Off Grid ${release.tag_name} is now live!`,
-    blocks: [
-      ...(isTest
-        ? [
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `*TEST MODE* — This is a preview of the release notification format.`,
-              },
-            },
-            { type: 'divider' },
-          ]
-        : []),
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*Off Grid ${release.tag_name} is now live!*${testBanner}`,
+  const fallbackNote = isGithubFallback
+    ? '\n_Source: GitHub release (store fetch was unavailable)_'
+    : '';
+
+  const headerText = platform === 'both'
+    ? `*Off Grid has a new update!*${testBanner}${fallbackNote}`
+    : platform === 'ios'
+      ? `*Off Grid v${ios?.version} is live on the App Store!*${testBanner}${fallbackNote}`
+      : `*Off Grid v${android?.version} is live on the Play Store!*${testBanner}${fallbackNote}`;
+
+  const blocks = [];
+
+  if (isTest) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `*TEST MODE* — This is a preview of the release notification format.` },
+    });
+    blocks.push({ type: 'divider' });
+  }
+
+  blocks.push({
+    type: 'section',
+    text: { type: 'mrkdwn', text: headerText },
+  });
+  blocks.push({ type: 'divider' });
+
+  // iOS section
+  if (ios && (platform === 'both' || platform === 'ios')) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*iOS — v${ios.version}*\n${formatNotes(ios.releaseNotes)}`,
+      },
+    });
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Update on App Store' },
+          style: 'primary',
+          url: IOS_UPDATE_URL,
+          action_id: 'ios_update',
         },
-      },
-      { type: 'divider' },
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*What's new:*\n${notes}`,
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Leave a Review' },
+          url: IOS_REVIEW_URL,
+          action_id: 'ios_review',
         },
+      ],
+    });
+  }
+
+  // Android section
+  if (android && (platform === 'both' || platform === 'android')) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Android — v${android.version}*\n${formatNotes(android.releaseNotes)}`,
       },
-      { type: 'divider' },
+    });
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Update on Play Store' },
+          style: 'primary',
+          url: ANDROID_UPDATE_URL,
+          action_id: 'android_update',
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Leave a Review' },
+          url: ANDROID_REVIEW_URL,
+          action_id: 'android_review',
+        },
+      ],
+    });
+  }
+
+  // Footer
+  blocks.push({ type: 'divider' });
+  blocks.push({
+    type: 'context',
+    elements: [
       {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `*iOS*` },
-      },
-      {
-        type: 'actions',
-        elements: [
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: 'Update on App Store' },
-            style: 'primary',
-            url: IOS_UPDATE_URL,
-            action_id: 'ios_update',
-          },
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: 'Leave a Review' },
-            url: IOS_REVIEW_URL,
-            action_id: 'ios_review',
-          },
-        ],
-      },
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `*Android*` },
-      },
-      {
-        type: 'actions',
-        elements: [
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: 'Update on Play Store' },
-            style: 'primary',
-            url: ANDROID_UPDATE_URL,
-            action_id: 'android_update',
-          },
-          {
-            type: 'button',
-            text: { type: 'plain_text', text: 'Leave a Review' },
-            url: ANDROID_REVIEW_URL,
-            action_id: 'android_review',
-          },
-        ],
-      },
-      { type: 'divider' },
-      {
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: `<${GITHUB_RELEASE_URL}|View full changelog on GitHub>  ·  Released ${new Date(release.published_at).toDateString()}`,
-          },
-        ],
+        type: 'mrkdwn',
+        text: isGithubFallback
+          ? `<${GITHUB_RELEASE_URL}|View on GitHub> · ${new Date().toDateString()}`
+          : `Detected from live store listings · ${new Date().toDateString()}`,
       },
     ],
+  });
+
+  return {
+    channel,
+    text: `Off Grid v${version} is now live!`,
+    blocks,
   };
 }
 
-async function checkForNewRelease() {
+// ── Polling logic ────────────────────────────────────────
+async function checkForStoreUpdates() {
   try {
-    const release = await fetchLatestRelease();
+    const storeInfo = await fetchStoreVersions();
+    const iosVersion = storeInfo.ios?.version || null;
+    const androidVersion = storeInfo.android?.version || null;
+    const bothFailed = !storeInfo.ios && !storeInfo.android;
 
-    if (!release.tag_name) {
-      console.log('No release found yet on GitHub');
-      return;
-    }
+    console.log(`Store check — iOS: ${iosVersion || 'FAILED'}, Android: ${androidVersion || 'FAILED'}`);
 
-    cachedRelease = release;
+    // ── If both stores failed, try GitHub fallback ──
+    if (bothFailed) {
+      console.log('Both store fetches failed — falling back to GitHub');
+      await sendAlertEmail(
+        'Store fetch failed — using GitHub fallback',
+        `Both App Store and Play Store fetches failed.\n\nFailures:\n${storeInfo.failures.join('\n')}\n\nFalling back to GitHub releases API.\n\nTimestamp: ${new Date().toISOString()}`,
+      );
 
-    if (lastSeenVersion === null) {
-      lastSeenVersion = release.tag_name;
-      console.log(`Current version: ${lastSeenVersion} — watching for new releases...`);
-      return;
-    }
+      try {
+        const ghRelease = await fetchGithubRelease();
+        if (!ghRelease.tag_name) {
+          console.log('GitHub fallback also returned no release');
+          return;
+        }
 
-    if (release.tag_name !== lastSeenVersion) {
-      console.log(`New release detected: ${release.tag_name}`);
-      lastSeenVersion = release.tag_name;
+        const ghStoreInfo = githubReleaseToStoreInfo(ghRelease);
+        cachedStoreInfo = ghStoreInfo;
 
-      if (RELEASES_CHANNEL_ID) {
-        const message = buildReleaseMessage(release);
-        await app.client.chat.postMessage(message);
-        console.log(`Posted release ${release.tag_name} to #releases`);
-      } else {
-        console.log('CH_RELEASES not set — skipping channel post');
+        if (lastSeenGithubVersion === null) {
+          lastSeenGithubVersion = ghRelease.tag_name;
+          console.log(`GitHub fallback — current version: ${ghRelease.tag_name}`);
+          return;
+        }
+
+        if (ghRelease.tag_name !== lastSeenGithubVersion) {
+          console.log(`GitHub fallback — new version: ${lastSeenGithubVersion} -> ${ghRelease.tag_name}`);
+          lastSeenGithubVersion = ghRelease.tag_name;
+
+          if (RELEASES_CHANNEL_ID) {
+            const message = buildReleaseMessage(ghStoreInfo);
+            await app.client.chat.postMessage(message);
+            console.log(`Posted GitHub fallback release ${ghRelease.tag_name} to #releases`);
+          }
+        }
+      } catch (ghErr) {
+        console.error('GitHub fallback also failed:', ghErr.message);
+        await sendAlertEmail(
+          'All release sources failed',
+          `App Store, Play Store, AND GitHub releases API all failed.\n\nStore failures:\n${storeInfo.failures.join('\n')}\n\nGitHub error: ${ghErr.message}\n\nThe bot cannot detect new releases right now. Please investigate.\n\nTimestamp: ${new Date().toISOString()}`,
+        );
       }
+      return;
+    }
+
+    // ── If one store failed, alert but continue with the working one ──
+    if (storeInfo.failures.length > 0) {
+      console.log(`Partial store failure: ${storeInfo.failures.join(', ')}`);
+      await sendAlertEmail(
+        'Partial store fetch failure',
+        `One store fetch failed (the other is still working).\n\nFailure:\n${storeInfo.failures.join('\n')}\n\nThe bot will continue using the working store.\n\nTimestamp: ${new Date().toISOString()}`,
+      );
+    }
+
+    // Cache for trigger-word responses
+    cachedStoreInfo = storeInfo;
+
+    // First run — record current versions, don't announce
+    if (lastSeenIosVersion === null && lastSeenAndroidVersion === null) {
+      lastSeenIosVersion = iosVersion;
+      lastSeenAndroidVersion = androidVersion;
+      console.log(`Watching — iOS: ${iosVersion}, Android: ${androidVersion}`);
+      return;
+    }
+
+    const iosChanged = iosVersion && iosVersion !== lastSeenIosVersion;
+    const androidChanged = androidVersion && androidVersion !== lastSeenAndroidVersion;
+
+    if (!iosChanged && !androidChanged) {
+      console.log('No store updates detected');
+      return;
+    }
+
+    let platform = 'both';
+    if (iosChanged && !androidChanged) platform = 'ios';
+    if (!iosChanged && androidChanged) platform = 'android';
+
+    if (iosChanged) {
+      console.log(`New iOS version: ${lastSeenIosVersion} -> ${iosVersion}`);
+      lastSeenIosVersion = iosVersion;
+    }
+    if (androidChanged) {
+      console.log(`New Android version: ${lastSeenAndroidVersion} -> ${androidVersion}`);
+      lastSeenAndroidVersion = androidVersion;
+    }
+
+    if (RELEASES_CHANNEL_ID) {
+      const message = buildReleaseMessage(storeInfo, { platform });
+      await app.client.chat.postMessage(message);
+      console.log(`Posted ${platform} release to #releases`);
     } else {
-      console.log(`No new release (still on ${lastSeenVersion})`);
+      console.log('CH_RELEASES not set — skipping channel post');
     }
   } catch (err) {
-    console.error('Error checking GitHub releases:', err.message);
+    console.error('Error in checkForStoreUpdates:', err.message);
   }
 }
 
@@ -338,24 +535,30 @@ async function checkForNewRelease() {
 // "what's new in offgrid" — responds in whatever channel it's posted
 app.message(/what'?s new in off\s?grid/i, async ({ message, client, logger }) => {
   try {
-    if (!cachedRelease) {
-      const release = await fetchLatestRelease();
-      if (release.tag_name) cachedRelease = release;
+    if (!cachedStoreInfo) {
+      const storeInfo = await fetchStoreVersions();
+      if (storeInfo.ios || storeInfo.android) {
+        cachedStoreInfo = storeInfo;
+      } else {
+        // Try GitHub as fallback for trigger too
+        const ghRelease = await fetchGithubRelease();
+        if (ghRelease.tag_name) cachedStoreInfo = githubReleaseToStoreInfo(ghRelease);
+      }
     }
 
-    if (!cachedRelease || !cachedRelease.tag_name) {
+    if (!cachedStoreInfo || (!cachedStoreInfo.ios && !cachedStoreInfo.android)) {
       await client.chat.postMessage({
         channel: message.channel,
         thread_ts: message.ts,
-        text: "No releases found yet — stay tuned!",
+        text: "No release info available yet — stay tuned!",
       });
       return;
     }
 
-    const msg = buildReleaseMessage(cachedRelease, {
+    const msg = buildReleaseMessage(cachedStoreInfo, {
       channel: message.channel,
     });
-    msg.thread_ts = message.ts; // reply in thread to keep channels clean
+    msg.thread_ts = message.ts;
     await client.chat.postMessage(msg);
     logger.info(`Replied to "what's new" trigger from ${message.user} in ${message.channel}`);
   } catch (err) {
@@ -367,17 +570,24 @@ app.message(/what'?s new in off\s?grid/i, async ({ message, client, logger }) =>
 app.message(/test release/i, async ({ message, client, logger }) => {
   try {
     logger.info(`Test release triggered by ${message.user}`);
-    const release = await fetchLatestRelease();
+    let storeInfo = await fetchStoreVersions();
 
-    if (!release.tag_name) {
-      await client.chat.postMessage({
-        channel: message.channel,
-        text: 'No releases found on GitHub yet.',
-      });
-      return;
+    // If both stores failed, try GitHub
+    if (!storeInfo.ios && !storeInfo.android) {
+      logger.info('Stores unavailable for test — trying GitHub fallback');
+      const ghRelease = await fetchGithubRelease();
+      if (ghRelease.tag_name) {
+        storeInfo = githubReleaseToStoreInfo(ghRelease);
+      } else {
+        await client.chat.postMessage({
+          channel: message.channel,
+          text: 'Could not fetch release info from stores or GitHub.',
+        });
+        return;
+      }
     }
 
-    const testMessage = buildReleaseMessage(release, {
+    const testMessage = buildReleaseMessage(storeInfo, {
       isTest: true,
       channel: message.channel,
     });
@@ -399,8 +609,10 @@ app.message(/test release/i, async ({ message, client, logger }) => {
 (async () => {
   await app.start();
   console.log('GridBot is running');
+  console.log('Polling: App Store + Play Store every 15 min (GitHub fallback if stores fail)');
+  console.log('Alerts:', mailer ? `emails to ${ALERT_EMAILS.join(', ')}` : 'SMTP not configured — email alerts disabled');
   console.log('Triggers: "what\'s new in offgrid" (any channel), "test release" (preview)');
 
-  await checkForNewRelease();
-  setInterval(checkForNewRelease, CHECK_INTERVAL_MS);
+  await checkForStoreUpdates();
+  setInterval(checkForStoreUpdates, CHECK_INTERVAL_MS);
 })();
